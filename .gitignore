@@ -1,0 +1,8 @@
+.env
+bike_alert.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+# NOTE: seen_ads.json is intentionally NOT ignored — GitHub Actions
+# commits it back to preserve state between runs.

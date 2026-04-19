@@ -1,0 +1,56 @@
+name: bike-alert
+
+on:
+  schedule:
+    # Every 5 minutes. GitHub often delays this during peak load,
+    # so real cadence is more like 5-15 min.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:  # lets you trigger manually from the Actions tab
+
+# Prevent overlapping runs — if a previous run is still going, skip this one.
+concurrency:
+  group: bike-alert
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # needed to commit seen_ads.json back to the repo
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one check
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python bike_alert.py --once
+
+      - name: Commit state if changed
+        run: |
+          if [[ -n "$(git status --porcelain seen_ads.json)" ]]; then
+            git config user.name  "bike-alert-bot"
+            git config user.email "bike-alert-bot@users.noreply.github.com"
+            git add seen_ads.json
+            git commit -m "chore: update seen_ads state [skip ci]"
+            # Retry push a couple of times in case of concurrent runs
+            for i in 1 2 3; do
+              git pull --rebase origin "${GITHUB_REF_NAME}" || true
+              git push && break
+              sleep 2
+            done
+          else
+            echo "No state change."
+          fi
