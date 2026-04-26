@@ -950,6 +950,28 @@ def _annotate_deal(ad, prices):
         ad["deal_pct"] = round((median - ad["price"]) / median * 100)
 
 
+def classify_email_ad(ad):
+    """
+    Try to attribute an LBC email ad to one of the SEARCHES entries by
+    matching `require_all` (and `require_any`) tokens against the link text.
+    Returns the matching SEARCHES dict, or None if no model matched.
+
+    This is what fixes the "all LBC emails share one bucket" bug — without
+    it, a 1500€ Van Rysel and a 3000€ Aeroad would be averaged together
+    and the deal_pct would be meaningless.
+    """
+    text = (ad.get("title", "") + " " + ad.get("body", "")).lower()
+    for search in SEARCHES:
+        req_all = [t.lower() for t in search.get("require_all", [])]
+        if not all(tok in text for tok in req_all):
+            continue
+        any_tokens = [t.lower() for t in search.get("require_any", [])]
+        if any_tokens and not any(tok in text for tok in any_tokens):
+            continue
+        return search
+    return None
+
+
 def check_once(seen, first_run, prices):
     """
     Returns (new_ads, run_stats) where run_stats is:
@@ -1005,16 +1027,29 @@ def check_once(seen, first_run, prices):
                 if ad["id"] in seen:
                     continue
                 seen[ad["id"]] = now_iso()
+
+                # Try to classify the email ad against a SEARCHES bucket
+                # so prices/medians are computed per model, not pooled.
+                matched = classify_email_ad(ad)
+
                 if first_run:
+                    # Still seed the right bucket during the first run
+                    if matched and ad.get("price"):
+                        record_price(prices, matched["name"], ad["price"])
                     continue
-                # No matches() filter — the LBC alert criteria already
-                # filtered server-side. We trust whatever LBC sent us.
-                ad["search_name"] = "Leboncoin alert"
-                # Email ads aren't tied to a specific SEARCHES bucket so
-                # we use a shared "lbc_email" price history bucket.
-                _annotate_deal(ad, prices)
-                if ad.get("price"):
-                    record_price(prices, "Leboncoin alert", ad["price"])
+
+                if matched:
+                    ad["search_name"] = matched["name"]
+                    _annotate_deal(ad, prices)
+                    if ad.get("price"):
+                        record_price(prices, matched["name"], ad["price"])
+                else:
+                    # Couldn't map this email to any of our 10 models —
+                    # still send the alert (don't lose info) but skip
+                    # the deal banner (no meaningful bucket).
+                    ad["search_name"] = "Leboncoin alert (non classé)"
+                    log(f"[*] lbc_email: ad not classified — '{ad.get('title','')[:80]}'")
+
                 new_ads.append(ad)
         except Exception as e:
             log(f"[!] lbc_email threw: {e}")
