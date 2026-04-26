@@ -11,9 +11,11 @@ import re
 import sys
 import json
 import time
+import email
+import imaplib
 import hashlib
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -43,12 +45,19 @@ except ImportError:
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "PUT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "PUT_CHAT_ID_HERE")
 
+# Gmail credentials for parsing Leboncoin alert emails (free DataDome bypass)
+GMAIL_USER         = os.getenv("GMAIL_USER", "")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
+GMAIL_LBC_FROM     = os.getenv("GMAIL_LBC_FROM", "leboncoin.fr")
+GMAIL_LOOKBACK_HOURS = int(os.getenv("GMAIL_LOOKBACK_HOURS", "24"))
+
 SEARCHES = [
+    # --- originals ---
     {
         "name": "Cube Attain C:62 Race (M)",
         "keywords": ["cube attain c:62 race", "cube attain c62 race",
                      "cube attain c 62"],
-        "require_all": ["cube", "attain"],          # title must contain both
+        "require_all": ["cube", "attain"],
         "size": "M",
         "max_price": 2800,
     },
@@ -59,6 +68,79 @@ SEARCHES = [
         "require_all": ["canyon", "roadlite"],
         "size": "M",
         "max_price": 1800,
+    },
+    # --- Van Rysel (Decathlon) — best value-for-money ---
+    {
+        "name": "Van Rysel RCR Pro Di2 (M)",
+        "keywords": ["van rysel rcr pro", "van rysel rcr",
+                     "decathlon van rysel rcr"],
+        "require_all": ["van rysel", "rcr"],
+        "require_any": ["di2", "ultegra", "axs"],
+        "size": "M",
+        "max_price": 2800,
+    },
+    {
+        "name": "Van Rysel EDR CF Di2 (M)",
+        "keywords": ["van rysel edr cf", "van rysel edr",
+                     "decathlon van rysel edr"],
+        "require_all": ["van rysel", "edr"],
+        "require_any": ["di2", "ultegra", "axs"],
+        "size": "M",
+        "max_price": 2200,
+    },
+    {
+        "name": "Van Rysel GRVL CF GRX Di2 (M)",
+        "keywords": ["van rysel grvl", "decathlon van rysel grvl",
+                     "van rysel gravel"],
+        "require_all": ["van rysel"],
+        "require_any": ["grvl", "gravel", "grx"],
+        "size": "M",
+        "max_price": 2700,
+    },
+    # --- Canyon ---
+    {
+        "name": "Canyon Ultimate CF SL Di2 (M)",
+        "keywords": ["canyon ultimate cf sl di2", "canyon ultimate cfsl",
+                     "canyon ultimate disc"],
+        "require_all": ["canyon", "ultimate"],
+        "require_any": ["di2", "axs"],
+        "size": "M",
+        "max_price": 3000,
+    },
+    {
+        "name": "Canyon Endurace CF Di2 (M)",
+        "keywords": ["canyon endurace cf di2", "canyon endurace disc"],
+        "require_all": ["canyon", "endurace"],
+        "require_any": ["di2", "axs"],
+        "size": "M",
+        "max_price": 2600,
+    },
+    {
+        "name": "Canyon Aeroad CF SL Di2 (M)",
+        "keywords": ["canyon aeroad cf sl", "canyon aeroad disc"],
+        "require_all": ["canyon", "aeroad"],
+        "require_any": ["di2", "axs"],
+        "size": "M",
+        "max_price": 3300,
+    },
+    {
+        "name": "Canyon Grizl CF GRX Di2 (M)",
+        "keywords": ["canyon grizl cf", "canyon grizl di2",
+                     "canyon grizl grx"],
+        "require_all": ["canyon", "grizl"],
+        "require_any": ["di2", "grx", "axs"],
+        "size": "M",
+        "max_price": 2800,
+    },
+    # --- Cube ---
+    {
+        "name": "Cube Attain GTC SLX Di2 (M)",
+        "keywords": ["cube attain gtc slx", "cube attain slx",
+                     "cube attain gtc di2"],
+        "require_all": ["cube", "attain"],
+        "require_any": ["slx", "di2", "ultegra"],
+        "size": "M",
+        "max_price": 3000,
     },
 ]
 
@@ -84,11 +166,13 @@ BIKE_INDICATORS = ["vélo", "velo", "bike", "fahrrad", "bicycle",
                    "vtc", "gravel", "route", "roadbike", "rennrad",
                    "e-bike", "ebike", "mountainbike", "mtb"]
 
-ENABLED_SOURCES = ["ebay", "vinted"]
-# Note: leboncoin and trocvelo are disabled because their DataDome
-# anti-bot blocks GitHub Actions IPs. Use Leboncoin's native email
-# alerts instead (free, instant). Re-add them here if you ever run
-# this on a residential IP (your own machine, home server, etc).
+ENABLED_SOURCES = ["ebay", "vinted", "lbc_email"]
+# Designed to run on GitHub Actions:
+#  - ebay + vinted: scraped directly from cloud IPs (no anti-bot block)
+#  - lbc_email: parses Gmail for native Leboncoin alert emails
+#    (DataDome can't block what doesn't go through scraping)
+# Direct LBC/Troc-Vélo scraping is left in code (search_leboncoin/
+# search_trocvelo) and only works from a residential IP.
 POLL_INTERVAL   = 300  # seconds between full scans
 
 STATE_FILE = Path(__file__).parent / "seen_ads.json"
@@ -120,7 +204,7 @@ def save_seen(seen):
     STATE_FILE.write_text(json.dumps(list(seen)))
 
 
-# ---------- telegram ----------
+# ---------- notifications ----------
 def send_telegram(text):
     if "PUT_TOKEN" in TELEGRAM_TOKEN:
         log("[!] TELEGRAM_TOKEN not configured — printing instead")
@@ -138,6 +222,32 @@ def send_telegram(text):
             log(f"[!] Telegram {r.status_code}: {r.text[:200]}")
     except Exception as e:
         log(f"[!] Telegram error: {e}")
+
+
+def send_mac_notification(title, subtitle, body):
+    """macOS native notification banner. Silent fail on non-Mac."""
+    if sys.platform != "darwin":
+        return
+    import subprocess
+    try:
+        # AppleScript escaping: replace " and \ with safe equivalents
+        def esc(s): return (s or "").replace("\\", " ").replace('"', "'")
+        script = (f'display notification "{esc(body)}" '
+                  f'with title "{esc(title)}" subtitle "{esc(subtitle)}"')
+        subprocess.run(["osascript", "-e", script],
+                       timeout=5, capture_output=True)
+    except Exception as e:
+        log(f"[!] Mac notification error: {e}")
+
+
+def notify(ad):
+    """Send all enabled notifications for one new ad."""
+    send_telegram(format_ad(ad))
+    send_mac_notification(
+        title=f"Nouvelle annonce — {ad['source']}",
+        subtitle=ad.get("search_name", ""),
+        body=f"{ad['title']} — {ad.get('price') or '?'}€",
+    )
 
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -438,6 +548,142 @@ def search_vinted(keywords, max_price):
     return results
 
 
+# ---------- leboncoin via Gmail (free DataDome bypass) ----------
+def search_leboncoin_email():
+    """
+    Connects to Gmail via IMAP, finds Leboncoin alert emails received
+    in the last GMAIL_LOOKBACK_HOURS, parses out new ad listings,
+    marks the emails as read so they're not re-processed.
+
+    Requires: GMAIL_USER + GMAIL_APP_PASSWORD env vars.
+    """
+    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
+        log("[!] lbc_email skipped: GMAIL_USER/GMAIL_APP_PASSWORD not set")
+        return []
+    if BeautifulSoup is None:
+        log("[!] lbc_email skipped: install beautifulsoup4")
+        return []
+
+    results = []
+    try:
+        imap = imaplib.IMAP4_SSL("imap.gmail.com", 993)
+        imap.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        imap.select("INBOX")
+
+        # Search for LBC emails received in the lookback window.
+        # Using SINCE (not UNSEEN) so a fresh deployment can backfill.
+        since = (datetime.now() - timedelta(hours=GMAIL_LOOKBACK_HOURS)
+                ).strftime("%d-%b-%Y")
+        criterion = f'(SINCE "{since}" FROM "{GMAIL_LBC_FROM}")'
+        status, data = imap.search(None, criterion)
+        if status != "OK":
+            log(f"[!] Gmail search failed: {status}")
+            imap.logout()
+            return []
+
+        msg_ids = data[0].split()
+        log(f"[*] lbc_email: {len(msg_ids)} LBC email(s) in last "
+            f"{GMAIL_LOOKBACK_HOURS}h")
+
+        for mid in msg_ids:
+            status, msg_data = imap.fetch(mid, "(RFC822)")
+            if status != "OK":
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+
+            # Extract HTML body
+            html = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    if part.get_content_type() == "text/html":
+                        try:
+                            charset = part.get_content_charset() or "utf-8"
+                            html = part.get_payload(decode=True).decode(
+                                charset, errors="replace")
+                            break
+                        except Exception:
+                            continue
+            elif msg.get_content_type() == "text/html":
+                try:
+                    charset = msg.get_content_charset() or "utf-8"
+                    html = msg.get_payload(decode=True).decode(
+                        charset, errors="replace")
+                except Exception:
+                    pass
+
+            if not html:
+                continue
+
+            # Extract ads from the HTML
+            soup = BeautifulSoup(html, "html.parser")
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                # Real ad URLs always have the path /ad/<category>/<id>
+                # or end with /<numeric_id>.htm
+                if "leboncoin.fr" not in href:
+                    continue
+                if not (re.search(r"/\d{8,}", href) or "/ad/" in href):
+                    continue
+
+                # Filter out unsubscribe / preferences / nav links by text
+                txt = a.get_text(" ", strip=True)
+                if not txt or len(txt) < 5:
+                    continue
+                low = txt.lower()
+                if any(x in low for x in [
+                    "désabonner", "désinscri", "désinscription",
+                    "préférences", "unsubscribe", "voir toutes",
+                    "modifier ma recherche", "gérer mes alertes",
+                ]):
+                    continue
+
+                # Try to extract price from the surrounding container
+                price = 0
+                container = a.find_parent(["td", "tr", "div"]) or a.find_parent()
+                if container:
+                    m = re.search(r"(\d[\d\s]{1,6})\s*€",
+                                  container.get_text(" "))
+                    if m:
+                        try:
+                            price = int(m.group(1).replace(" ", ""))
+                        except ValueError:
+                            pass
+
+                clean_url = href.split("?")[0]
+                ad_id = (f"lbcmail_"
+                         f"{hashlib.md5(clean_url.encode()).hexdigest()[:12]}")
+
+                results.append({
+                    "source": "leboncoin (email)",
+                    "id":    ad_id,
+                    "title": txt,
+                    "body":  "",
+                    "price": price,
+                    "url":   clean_url,
+                    "location": "",
+                })
+
+            # Mark email as read so we don't reprocess on next tick
+            try:
+                imap.store(mid, "+FLAGS", "\\Seen")
+            except Exception:
+                pass
+
+        imap.logout()
+    except Exception as e:
+        log(f"[!] lbc_email error: {e}")
+
+    # Dedupe within this batch
+    seen_local = set()
+    uniq = []
+    for r in results:
+        if r["id"] in seen_local:
+            continue
+        seen_local.add(r["id"])
+        uniq.append(r)
+    return uniq
+
+
 # ---------- filter ----------
 def matches(ad, search):
     """
@@ -448,9 +694,15 @@ def matches(ad, search):
     """
     text = f"{ad['title']} {ad.get('body','')}".lower()
 
-    # (1) strict model match
+    # (1a) strict model match — all of these must be present
     for token in search.get("require_all", []):
         if token.lower() not in text:
+            return False
+
+    # (1b) at least one of these must be present (e.g. "di2" or "axs")
+    any_tokens = search.get("require_any", [])
+    if any_tokens:
+        if not any(tok.lower() in text for tok in any_tokens):
             return False
 
     # (2) accessory filter
@@ -490,9 +742,12 @@ SEARCH_FUNCS = {
 
 def check_once(seen, first_run):
     new_ads = []
+
+    # --- per-search keyword sources (vinted, ebay, lbc, troc) ---
+    keyword_sources = [s for s in ENABLED_SOURCES if s != "lbc_email"]
     for search in SEARCHES:
         found = []
-        for src in ENABLED_SOURCES:
+        for src in keyword_sources:
             fn = SEARCH_FUNCS.get(src)
             if not fn: continue
             try:
@@ -506,6 +761,22 @@ def check_once(seen, first_run):
             if not matches(ad, search): continue
             ad["search_name"] = search["name"]
             new_ads.append(ad)
+
+    # --- lbc_email source: queried once (emails contain pre-filtered ads) ---
+    if "lbc_email" in ENABLED_SOURCES:
+        try:
+            email_ads = search_leboncoin_email()
+            for ad in email_ads:
+                if ad["id"] in seen: continue
+                seen.add(ad["id"])
+                if first_run: continue
+                # No matches() filter — the LBC alert criteria already
+                # filtered server-side. We trust whatever LBC sent us.
+                ad["search_name"] = "Leboncoin alert"
+                new_ads.append(ad)
+        except Exception as e:
+            log(f"[!] lbc_email threw: {e}")
+
     return new_ads
 
 
@@ -528,7 +799,7 @@ def run_tick(seen):
     else:
         for ad in new_ads:
             log(f"[+] NEW: {ad['source']} | {ad['title']}")
-            send_telegram(format_ad(ad))
+            notify(ad)
         log(f"Tick: {len(new_ads)} new · {len(seen)} total seen.")
     return new_ads, first_run
 
