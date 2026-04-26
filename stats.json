@@ -1,4 +1,17 @@
 {
-"runs": [],
+"runs": [
+{
+"ts": "2026-04-26T17:02:53",
+"new_ads": 0,
+"total_found": 560,
+"sources_ok": [
+"ebay",
+"vinted",
+"lbc_email"
+],
+"sources_failed": [],
+"total_seen": 1518
+}
+],
 "last_heartbeat": "2026-04-26T18:42:13"
 }
