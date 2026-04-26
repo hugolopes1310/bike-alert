@@ -84,7 +84,11 @@ BIKE_INDICATORS = ["vélo", "velo", "bike", "fahrrad", "bicycle",
                    "vtc", "gravel", "route", "roadbike", "rennrad",
                    "e-bike", "ebike", "mountainbike", "mtb"]
 
-ENABLED_SOURCES = ["leboncoin", "ebay", "trocvelo", "vinted"]
+ENABLED_SOURCES = ["ebay", "vinted"]
+# Note: leboncoin and trocvelo are disabled because their DataDome
+# anti-bot blocks GitHub Actions IPs. Use Leboncoin's native email
+# alerts instead (free, instant). Re-add them here if you ever run
+# this on a residential IP (your own machine, home server, etc).
 POLL_INTERVAL   = 300  # seconds between full scans
 
 STATE_FILE = Path(__file__).parent / "seen_ads.json"
