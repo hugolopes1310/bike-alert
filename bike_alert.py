@@ -175,8 +175,20 @@ ENABLED_SOURCES = ["ebay", "vinted", "lbc_email"]
 # search_trocvelo) and only works from a residential IP.
 POLL_INTERVAL   = 300  # seconds between full scans
 
-STATE_FILE = Path(__file__).parent / "seen_ads.json"
-LOG_FILE   = Path(__file__).parent / "bike_alert.log"
+STATE_FILE  = Path(__file__).parent / "seen_ads.json"
+STATS_FILE  = Path(__file__).parent / "stats.json"
+PRICES_FILE = Path(__file__).parent / "prices.json"
+LOG_FILE    = Path(__file__).parent / "bike_alert.log"
+
+# How long we keep things around in the JSON state files.
+SEEN_RETENTION_DAYS   = 30   # an ad we saw 30+ days ago can be re-pinged
+PRICES_RETENTION_DAYS = 90   # 3 months of price history per model
+STATS_RETENTION_DAYS  = 14   # only need last week for the heartbeat
+
+# Deal scoring: ping with 🔥 if price ≤ (median × (1 - DEAL_THRESHOLD_PCT/100))
+DEAL_THRESHOLD_PCT = 15
+# Need at least this many historical data points before we trust the median
+DEAL_MIN_SAMPLES = 5
 # ================================
 
 
@@ -192,16 +204,119 @@ def log(msg):
 
 
 # ---------- state ----------
+def now_iso():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def load_seen():
-    if STATE_FILE.exists():
-        try:
-            return set(json.loads(STATE_FILE.read_text()))
-        except Exception:
-            return set()
-    return set()
+    """
+    Returns a dict of {ad_id: first_seen_iso}.
+    Backward-compatible with the old list-of-ids format.
+    """
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+    if isinstance(raw, list):
+        # migrate from old format — give every existing id a "now" timestamp
+        ts = now_iso()
+        return {ad_id: ts for ad_id in raw}
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
 
 def save_seen(seen):
-    STATE_FILE.write_text(json.dumps(list(seen)))
+    """Prune entries older than SEEN_RETENTION_DAYS, then persist."""
+    cutoff = datetime.now() - timedelta(days=SEEN_RETENTION_DAYS)
+    pruned = {
+        ad_id: ts for ad_id, ts in seen.items()
+        if (_parse_iso(ts) or datetime.now()) >= cutoff
+    }
+    dropped = len(seen) - len(pruned)
+    seen.clear()
+    seen.update(pruned)
+    STATE_FILE.write_text(json.dumps(seen, indent=0))
+    if dropped:
+        log(f"[*] Pruned {dropped} ads older than {SEEN_RETENTION_DAYS}d")
+
+
+# ---------- stats (for heartbeat) ----------
+def load_stats():
+    if not STATS_FILE.exists():
+        return {"runs": [], "last_heartbeat": None}
+    try:
+        s = json.loads(STATS_FILE.read_text())
+        s.setdefault("runs", [])
+        s.setdefault("last_heartbeat", None)
+        return s
+    except Exception:
+        return {"runs": [], "last_heartbeat": None}
+
+
+def save_stats(stats):
+    cutoff = datetime.now() - timedelta(days=STATS_RETENTION_DAYS)
+    stats["runs"] = [
+        r for r in stats.get("runs", [])
+        if (_parse_iso(r.get("ts")) or datetime.now()) >= cutoff
+    ]
+    STATS_FILE.write_text(json.dumps(stats, indent=0))
+
+
+# ---------- prices (for deal scoring) ----------
+def load_prices():
+    if not PRICES_FILE.exists():
+        return {}
+    try:
+        return json.loads(PRICES_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_prices(prices):
+    cutoff = datetime.now() - timedelta(days=PRICES_RETENTION_DAYS)
+    pruned = {}
+    for name, points in prices.items():
+        kept = [p for p in points
+                if (_parse_iso(p.get("ts")) or datetime.now()) >= cutoff]
+        if kept:
+            pruned[name] = kept
+    PRICES_FILE.write_text(json.dumps(pruned, indent=0))
+
+
+def record_price(prices, search_name, price):
+    """Append a price observation for a given search."""
+    if not price or price <= 0:
+        return
+    prices.setdefault(search_name, []).append({
+        "ts": now_iso(),
+        "price": int(price),
+    })
+
+
+def get_median_price(prices, search_name):
+    """Return the median price for a search, or None if too few samples."""
+    points = prices.get(search_name, [])
+    if len(points) < DEAL_MIN_SAMPLES:
+        return None
+    sorted_p = sorted(int(p["price"]) for p in points if p.get("price"))
+    if not sorted_p:
+        return None
+    n = len(sorted_p)
+    if n % 2:
+        return sorted_p[n // 2]
+    return (sorted_p[n // 2 - 1] + sorted_p[n // 2]) / 2
 
 
 # ---------- notifications ----------
@@ -209,7 +324,7 @@ def send_telegram(text):
     if "PUT_TOKEN" in TELEGRAM_TOKEN:
         log("[!] TELEGRAM_TOKEN not configured — printing instead")
         print(text)
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(url, data={
@@ -220,8 +335,42 @@ def send_telegram(text):
         }, timeout=10)
         if r.status_code != 200:
             log(f"[!] Telegram {r.status_code}: {r.text[:200]}")
+            return False
+        return True
     except Exception as e:
         log(f"[!] Telegram error: {e}")
+        return False
+
+
+def send_telegram_photo(image_url, caption):
+    """
+    sendPhoto with a caption (HTML formatted). Telegram captions are limited
+    to 1024 chars. Returns True on success; on failure caller should fall
+    back to a plain text message so the user always gets the alert.
+    """
+    if "PUT_TOKEN" in TELEGRAM_TOKEN:
+        log("[!] TELEGRAM_TOKEN not configured — printing instead")
+        print(caption)
+        return False
+    if not image_url:
+        return False
+    if len(caption) > 1024:
+        caption = caption[:1020] + "…"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    try:
+        r = requests.post(url, data={
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "photo":      image_url,
+            "caption":    caption,
+            "parse_mode": "HTML",
+        }, timeout=15)
+        if r.status_code != 200:
+            log(f"[!] Telegram photo {r.status_code}: {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log(f"[!] Telegram photo error: {e}")
+        return False
 
 
 def send_mac_notification(title, subtitle, body):
@@ -242,7 +391,12 @@ def send_mac_notification(title, subtitle, body):
 
 def notify(ad):
     """Send all enabled notifications for one new ad."""
-    send_telegram(format_ad(ad))
+    caption = format_ad(ad)
+    sent_via_photo = False
+    if ad.get("image_url"):
+        sent_via_photo = send_telegram_photo(ad["image_url"], caption)
+    if not sent_via_photo:
+        send_telegram(caption)
     send_mac_notification(
         title=f"Nouvelle annonce — {ad['source']}",
         subtitle=ad.get("search_name", ""),
@@ -324,6 +478,14 @@ def search_leboncoin(keywords, max_price):
                 p = ad.get("price")
                 if isinstance(p, list) and p: price = p[0]
                 elif isinstance(p, (int, float)): price = p
+                img_url = ""
+                images = ad.get("images") or {}
+                if isinstance(images, dict):
+                    urls = images.get("urls") or []
+                    if isinstance(urls, list) and urls:
+                        img_url = urls[0]
+                    if not img_url:
+                        img_url = images.get("thumb_url") or ""
                 results.append({
                     "source": "leboncoin",
                     "id":    f"lbc_{ad.get('list_id')}",
@@ -332,6 +494,7 @@ def search_leboncoin(keywords, max_price):
                     "price": price,
                     "url":   ad.get("url", ""),
                     "location": (ad.get("location") or {}).get("city", ""),
+                    "image_url": img_url,
                 })
         except Exception as e:
             log(f"[!] LBC error '{kw}': {e}")
@@ -381,11 +544,21 @@ def search_ebay(keywords, max_price):
                         except ValueError: pass
                 if price and price > max_price:
                     continue
+                # Pull thumbnail (eBay lazy-loads, so check data-src too)
+                img_url = ""
+                img = li.select_one("img.s-item__image-img, img")
+                if img:
+                    img_url = (img.get("src") or img.get("data-src")
+                               or img.get("data-defer-load") or "")
+                    # eBay sometimes serves a 1x1 placeholder; ignore it
+                    if "ir.ebaystatic" in img_url or "s-l1.gif" in img_url:
+                        img_url = img.get("data-src") or ""
                 results.append({
                     "source": "ebay",
                     "id":    f"ebay_{hashlib.md5(href.encode()).hexdigest()[:12]}",
                     "title": title, "body": "",
                     "price": price, "url": href, "location": "",
+                    "image_url": img_url,
                 })
         except Exception as e:
             log(f"[!] eBay error '{kw}': {e}")
@@ -534,6 +707,14 @@ def search_vinted(keywords, max_price):
                 else:
                     try: price = float(price_obj)
                     except (TypeError, ValueError): price = 0
+                # Photo: Vinted returns photo as object, sometimes a list of photos
+                img_url = ""
+                photo = item.get("photo")
+                if isinstance(photo, dict):
+                    img_url = photo.get("url") or photo.get("full_size_url") or ""
+                elif isinstance(item.get("photos"), list) and item["photos"]:
+                    img_url = (item["photos"][0].get("url")
+                               or item["photos"][0].get("full_size_url") or "")
                 results.append({
                     "source": "vinted",
                     "id":    f"vin_{item.get('id')}",
@@ -542,6 +723,7 @@ def search_vinted(keywords, max_price):
                     "price": int(price) if price else 0,
                     "url":   item.get("url", ""),
                     "location": "",
+                    "image_url": img_url,
                 })
         except Exception as e:
             log(f"[!] Vinted error '{kw}': {e}")
@@ -649,6 +831,22 @@ def search_leboncoin_email():
                         except ValueError:
                             pass
 
+                # Find a thumbnail: prefer <img> nested inside the <a>,
+                # otherwise look at the same container.
+                img_url = ""
+                inner_img = a.find("img")
+                if inner_img and inner_img.get("src"):
+                    img_url = inner_img["src"]
+                elif container:
+                    other_img = container.find("img")
+                    if other_img and other_img.get("src"):
+                        cand = other_img["src"]
+                        # Skip tiny tracking pixels & email-template chrome
+                        if not any(x in cand.lower() for x in [
+                            "pixel", "tracking", "logo", "icon", "spacer",
+                        ]):
+                            img_url = cand
+
                 clean_url = href.split("?")[0]
                 ad_id = (f"lbcmail_"
                          f"{hashlib.md5(clean_url.encode()).hexdigest()[:12]}")
@@ -661,6 +859,7 @@ def search_leboncoin_email():
                     "price": price,
                     "url":   clean_url,
                     "location": "",
+                    "image_url": img_url,
                 })
 
             # Mark email as read so we don't reprocess on next tick
@@ -740,8 +939,25 @@ SEARCH_FUNCS = {
     "vinted":    search_vinted,
 }
 
-def check_once(seen, first_run):
+def _annotate_deal(ad, prices):
+    """Tag an ad with the median price + deal_pct for its search bucket."""
+    if not ad.get("price"):
+        return
+    bucket = ad.get("search_name") or "default"
+    median = get_median_price(prices, bucket)
+    if median:
+        ad["median_price"] = median
+        ad["deal_pct"] = round((median - ad["price"]) / median * 100)
+
+
+def check_once(seen, first_run, prices):
+    """
+    Returns (new_ads, run_stats) where run_stats is:
+        {sources_ok: [...], sources_failed: [...], total_found: int}
+    Mutates `seen` (adds new ids) and `prices` (records observations).
+    """
     new_ads = []
+    run_stats = {"sources_ok": [], "sources_failed": [], "total_found": 0}
 
     # --- per-search keyword sources (vinted, ebay, lbc, troc) ---
     keyword_sources = [s for s in ENABLED_SOURCES if s != "lbc_email"]
@@ -751,56 +967,198 @@ def check_once(seen, first_run):
             fn = SEARCH_FUNCS.get(src)
             if not fn: continue
             try:
-                found += fn(search["keywords"], search["max_price"])
+                results = fn(search["keywords"], search["max_price"])
+                found += results
+                if src not in run_stats["sources_ok"]:
+                    run_stats["sources_ok"].append(src)
             except Exception as e:
                 log(f"[!] {src} threw: {e}")
+                err = f"{src}: {type(e).__name__}"
+                if err not in run_stats["sources_failed"]:
+                    run_stats["sources_failed"].append(err)
+        run_stats["total_found"] += len(found)
+
         for ad in found:
-            if ad["id"] in seen: continue
-            seen.add(ad["id"])
-            if first_run: continue
-            if not matches(ad, search): continue
+            if ad["id"] in seen:
+                continue
+            seen[ad["id"]] = now_iso()
+            if first_run:
+                # Still record price so we build history during the seed run
+                if matches(ad, search) and ad.get("price"):
+                    record_price(prices, search["name"], ad["price"])
+                continue
+            if not matches(ad, search):
+                continue
             ad["search_name"] = search["name"]
+            # Score against historical median BEFORE recording this point
+            _annotate_deal(ad, prices)
+            record_price(prices, search["name"], ad["price"])
             new_ads.append(ad)
 
     # --- lbc_email source: queried once (emails contain pre-filtered ads) ---
     if "lbc_email" in ENABLED_SOURCES:
         try:
             email_ads = search_leboncoin_email()
+            run_stats["sources_ok"].append("lbc_email")
+            run_stats["total_found"] += len(email_ads)
             for ad in email_ads:
-                if ad["id"] in seen: continue
-                seen.add(ad["id"])
-                if first_run: continue
+                if ad["id"] in seen:
+                    continue
+                seen[ad["id"]] = now_iso()
+                if first_run:
+                    continue
                 # No matches() filter — the LBC alert criteria already
                 # filtered server-side. We trust whatever LBC sent us.
                 ad["search_name"] = "Leboncoin alert"
+                # Email ads aren't tied to a specific SEARCHES bucket so
+                # we use a shared "lbc_email" price history bucket.
+                _annotate_deal(ad, prices)
+                if ad.get("price"):
+                    record_price(prices, "Leboncoin alert", ad["price"])
                 new_ads.append(ad)
         except Exception as e:
             log(f"[!] lbc_email threw: {e}")
+            run_stats["sources_failed"].append(f"lbc_email: {type(e).__name__}")
 
-    return new_ads
+    return new_ads, run_stats
 
 
 def format_ad(ad):
     price = f"{ad['price']}€" if ad.get("price") else "prix ?"
     loc   = f" — {ad['location']}" if ad.get("location") else ""
-    return (f"🚴 <b>{ad['search_name']}</b>\n"
+
+    # Deal scoring banner
+    banner = ""
+    median = ad.get("median_price")
+    deal_pct = ad.get("deal_pct")
+    if median and deal_pct is not None:
+        if deal_pct >= DEAL_THRESHOLD_PCT:
+            banner = (f"🔥 <b>BONNE AFFAIRE — {deal_pct}% sous la médiane</b>"
+                      f" (médiane {int(median)}€)\n")
+        elif deal_pct <= -DEAL_THRESHOLD_PCT:
+            banner = (f"💸 Au-dessus du marché ({-deal_pct}% > médiane "
+                      f"{int(median)}€)\n")
+        else:
+            banner = f"📊 Prix conforme au marché (médiane {int(median)}€)\n"
+
+    return (banner +
+            f"🚴 <b>{ad['search_name']}</b>\n"
             f"{ad['title']}\n"
             f"{price}{loc} · <i>{ad['source']}</i>\n"
             f"{ad['url']}")
 
 
+# ---------- weekly heartbeat ----------
+def _build_heartbeat_message(stats, seen, prices):
+    """Compose the weekly summary text (HTML)."""
+    runs = stats.get("runs", [])
+    if not runs:
+        return ("🩺 <b>Bike-alert weekly heartbeat</b>\n"
+                "Aucun run enregistré cette semaine.")
+
+    total_runs    = len(runs)
+    total_new     = sum(r.get("new_ads", 0)   for r in runs)
+    total_found   = sum(r.get("total_found", 0) for r in runs)
+    failed_runs   = [r for r in runs if r.get("sources_failed")]
+    err_summary = {}
+    for r in failed_runs:
+        for e in r.get("sources_failed", []):
+            err_summary[e] = err_summary.get(e, 0) + 1
+
+    sources_seen = set()
+    for r in runs:
+        for s in r.get("sources_ok", []):
+            sources_seen.add(s)
+
+    # Median per search (skip those with too few samples)
+    median_lines = []
+    for search in SEARCHES:
+        m = get_median_price(prices, search["name"])
+        n = len(prices.get(search["name"], []))
+        if m:
+            median_lines.append(f"  • {search['name']}: <b>{int(m)}€</b> "
+                                f"<i>(n={n})</i>")
+    if not median_lines:
+        median_lines = ["  <i>Pas encore assez d'historique de prix.</i>"]
+
+    err_lines = ([f"  • {e}: {n}×" for e, n in err_summary.items()]
+                 if err_summary else ["  ✅ Aucune erreur"])
+
+    return (
+        f"🩺 <b>Bike-alert — récap hebdo</b>\n"
+        f"\n"
+        f"<b>Activité (7j)</b>\n"
+        f"  • {total_runs} runs · {total_found} annonces vues · "
+        f"{total_new} nouvelles\n"
+        f"  • Sources actives: {', '.join(sorted(sources_seen)) or '—'}\n"
+        f"  • Annonces en mémoire: {len(seen)}\n"
+        f"\n"
+        f"<b>Erreurs</b>\n"
+        + "\n".join(err_lines) + "\n"
+        f"\n"
+        f"<b>Médianes prix</b>\n"
+        + "\n".join(median_lines)
+    )
+
+
+def maybe_send_heartbeat(stats, seen, prices):
+    """
+    Send a weekly summary on Sundays (8-12h UTC), at most once per 6 days.
+    Modifies stats['last_heartbeat'] on send.
+    """
+    now = datetime.now()
+    if now.weekday() != 6:  # Sunday = 6
+        return
+    if not (8 <= now.hour < 12):
+        return
+    last = _parse_iso(stats.get("last_heartbeat"))
+    if last and (now - last).days < 6:
+        return
+    msg = _build_heartbeat_message(stats, seen, prices)
+    if send_telegram(msg):
+        stats["last_heartbeat"] = now_iso()
+        log("[*] Weekly heartbeat sent.")
+
+
 def run_tick(seen):
     """Execute one check cycle. Returns (new_ads, first_run_flag)."""
     first_run = len(seen) == 0
-    new_ads = check_once(seen, first_run)
+    prices = load_prices()
+    stats  = load_stats()
+
+    new_ads, run_stats = check_once(seen, first_run, prices)
+
+    # Persist state
     save_seen(seen)
+    save_prices(prices)
+
+    # Record this tick in the rolling history
+    stats.setdefault("runs", []).append({
+        "ts":             now_iso(),
+        "new_ads":        len(new_ads),
+        "total_found":    run_stats["total_found"],
+        "sources_ok":     run_stats["sources_ok"],
+        "sources_failed": run_stats["sources_failed"],
+        "total_seen":     len(seen),
+    })
+
     if first_run:
         log(f"First run — seeded {len(seen)} existing ads silently.")
     else:
         for ad in new_ads:
-            log(f"[+] NEW: {ad['source']} | {ad['title']}")
+            tag = ""
+            if ad.get("deal_pct") is not None and ad["deal_pct"] >= DEAL_THRESHOLD_PCT:
+                tag = f" 🔥-{ad['deal_pct']}%"
+            log(f"[+] NEW: {ad['source']} | {ad['title']}{tag}")
             notify(ad)
-        log(f"Tick: {len(new_ads)} new · {len(seen)} total seen.")
+        log(f"Tick: {len(new_ads)} new · {len(seen)} total seen · "
+            f"{run_stats['total_found']} found · "
+            f"failures: {run_stats['sources_failed'] or 'none'}")
+
+    # Heartbeat decision (no-op outside the Sunday window)
+    maybe_send_heartbeat(stats, seen, prices)
+
+    save_stats(stats)
     return new_ads, first_run
 
 
@@ -825,8 +1183,25 @@ def main_once():
     run_tick(seen)
 
 
+def main_heartbeat():
+    """Force-send the heartbeat now (manual trigger / debugging)."""
+    log("Forcing heartbeat send.")
+    seen   = load_seen()
+    prices = load_prices()
+    stats  = load_stats()
+    msg = _build_heartbeat_message(stats, seen, prices)
+    if send_telegram(msg):
+        stats["last_heartbeat"] = now_iso()
+        save_stats(stats)
+        log("[*] Heartbeat forced & sent.")
+    else:
+        log("[!] Heartbeat send failed.")
+
+
 if __name__ == "__main__":
-    if "--once" in sys.argv:
+    if "--heartbeat" in sys.argv:
+        main_heartbeat()
+    elif "--once" in sys.argv:
         main_once()
     else:
         main_loop()

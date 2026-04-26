@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write   # needed to commit seen_ads.json back to the repo
+  contents: write   # needed to commit state JSONs back to the repo
 
 # Opt into Node.js 24 for JS actions (Node 20 is being deprecated by GitHub
 # in June 2026). Removes the deprecation warning.
@@ -47,11 +47,14 @@ jobs:
 
       - name: Commit state if changed
         run: |
-          if [[ -n "$(git status --porcelain seen_ads.json)" ]]; then
+          # Track all 3 state files: seen_ads (dedup), prices (deal scoring),
+          # stats (weekly heartbeat history).
+          STATE_FILES="seen_ads.json prices.json stats.json"
+          if [[ -n "$(git status --porcelain $STATE_FILES)" ]]; then
             git config user.name  "bike-alert-bot"
             git config user.email "bike-alert-bot@users.noreply.github.com"
-            git add seen_ads.json
-            git commit -m "chore: update seen_ads state [skip ci]"
+            git add $STATE_FILES
+            git commit -m "chore: update bot state [skip ci]"
             # Retry push a couple of times in case of concurrent runs
             for i in 1 2 3; do
               git pull --rebase origin "${GITHUB_REF_NAME}" || true

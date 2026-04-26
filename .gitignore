@@ -4,6 +4,7 @@ __pycache__/
 *.pyc
 .venv/
 venv/
-# NOTE: seen_ads.json is intentionally NOT ignored — GitHub Actions
-# commits it back to preserve state between runs.
+# NOTE: seen_ads.json, stats.json and prices.json are intentionally
+# NOT ignored — GitHub Actions commits them back to preserve state
+# (deduplication, weekly heartbeat history, deal-scoring medians).
 .DS_Store
