@@ -15,6 +15,11 @@ concurrency:
 permissions:
   contents: write   # needed to commit seen_ads.json back to the repo
 
+# Opt into Node.js 24 for JS actions (Node 20 is being deprecated by GitHub
+# in June 2026). Removes the deprecation warning.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   check:
     runs-on: ubuntu-latest
