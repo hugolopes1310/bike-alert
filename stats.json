@@ -575,6 +575,18 @@
 ],
 "sources_failed": [],
 "total_seen": 2540
+},
+{
+"ts": "2026-04-30T00:09:38",
+"new_ads": 0,
+"total_found": 562,
+"sources_ok": [
+"ebay",
+"vinted",
+"lbc_email"
+],
+"sources_failed": [],
+"total_seen": 2547
 }
 ],
 "last_heartbeat": "2026-04-26T18:42:13"
