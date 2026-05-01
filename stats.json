@@ -803,6 +803,18 @@
 ],
 "sources_failed": [],
 "total_seen": 2860
+},
+{
+"ts": "2026-05-01T11:49:01",
+"new_ads": 0,
+"total_found": 586,
+"sources_ok": [
+"ebay",
+"vinted",
+"lbc_email"
+],
+"sources_failed": [],
+"total_seen": 2868
 }
 ],
 "last_heartbeat": "2026-04-26T18:42:13"
