@@ -1223,6 +1223,18 @@
 ],
 "sources_failed": [],
 "total_seen": 3271
+},
+{
+"ts": "2026-05-03T09:48:48",
+"new_ads": 0,
+"total_found": 580,
+"sources_ok": [
+"ebay",
+"vinted",
+"lbc_email"
+],
+"sources_failed": [],
+"total_seen": 3285
 }
 ],
 "last_heartbeat": "2026-05-03T08:25:28"
